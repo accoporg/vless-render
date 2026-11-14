@@ -1,0 +1,14 @@
+{
+  "name": "accopture-vless-node",
+  "version": "1.0.0",
+  "private": true,
+  "description": "VLESS-over-WebSocket relay node with live telemetry for container and Render runtimes",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "start:render": "node render.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
