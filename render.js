@@ -2,10 +2,11 @@
  * Production VLESS-over-WS Server for Render / Edge-TLS PaaS (render.js)
  * - Runs plain HTTP behind Render's TLS-terminating edge proxy (listens on process.env.PORT || 10000)
  * - Auto-registers RENDER_EXTERNAL_HOSTNAME (or PUBLIC_HOST) on port 443 with WORKER_BASE_URL on startup
- * - Reports live heartbeats, RAM/uptime, per-token bandwidth, and active client IPs to Worker
+ * - Supports VLESS TCP (0x01), UDP (0x02), and MuxCool/XUDP (0x03) with post-DNS SSRF protection
  * - Set LOG_VERBOSE=1 to log every TCP/UDP dial; defaults to [SYS] and [ERR] only
  */
 const http = require('http');
+const dns = require('dns');
 const net = require('net');
 const dgram = require('dgram');
 const https = require('https');
@@ -27,8 +28,16 @@ const VLESS_UUID_BYTES = Buffer.from(VLESS_UUID, 'hex');
 const MAX_CHUNK = Number(process.env.MAX_WS_CHUNK || 16384);
 const LOG_VERBOSE = process.env.LOG_VERBOSE === '1';
 
+let registered = false;
+
 const VLESS_RESP_HEADER = Buffer.from([0x00, 0x00]);
 const EMPTY_BUF = Buffer.alloc(0);
+const MAX_CONNS_PER_TOKEN = Number(process.env.MAX_CONNS_PER_TOKEN || 64);
+const MAX_TOTAL_CONNS = Number(process.env.MAX_TOTAL_CONNS || 256);
+const UPSTREAM_FAMILY = Number(process.env.UPSTREAM_FAMILY || 4);
+const ALLOW_ALL_PORTS = process.env.ALLOW_ALL_PORTS === '1';
+
+const BLOCKED_ABUSE_PORTS = new Set([21, 22, 23, 25, 69, 111, 135, 137, 138, 139, 179, 445, 554, 1433, 3306, 3389, 5900]);
 
 const workerAgent = new https.Agent({
   keepAlive: true,
@@ -37,7 +46,6 @@ const workerAgent = new https.Agent({
 });
 
 let connSeq = 0;
-let registered = false;
 
 const nodeMetrics = {
   startedAt: Date.now(),
@@ -55,6 +63,21 @@ const nodeMetrics = {
 
 /** @type {Map<string, { tx: number, rx: number, conns: number, lastSeen: number }>} */
 const tokenDeltas = new Map();
+
+/** @type {Map<string, number>} */
+const activeTokenConns = new Map();
+
+function incrementTokenConns(token) {
+  if (!token) return;
+  activeTokenConns.set(token, (activeTokenConns.get(token) || 0) + 1);
+}
+
+function decrementTokenConns(token) {
+  if (!token) return;
+  const cur = (activeTokenConns.get(token) || 0) - 1;
+  if (cur <= 0) activeTokenConns.delete(token);
+  else activeTokenConns.set(token, cur);
+}
 
 function recordTraffic(ws, dir, bytes) {
   if (!bytes || bytes <= 0) return;
@@ -152,6 +175,8 @@ function parseIpv6Words(addr) {
 
 function isBlockedTarget(host, port) {
   if (!host || port <= 0 || port > 65535) return true;
+  if (!ALLOW_ALL_PORTS && BLOCKED_ABUSE_PORTS.has(port)) return true;
+
   const cleanHost = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
   const lower = cleanHost.toLowerCase();
   if (
@@ -198,41 +223,95 @@ function isBlockedTarget(host, port) {
   return false;
 }
 
-function registerRenderHost() {
-  if (!PUBLIC_HOST) return;
-  const payload = JSON.stringify({
-    host: PUBLIC_HOST,
-    port: PUBLIC_PORT,
-    replaceHost: true
-  });
-  const req = https.request(
-    `${WORKER_BASE_URL}/api/register`,
-    {
-      method: 'POST',
-      agent: workerAgent,
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload),
-        'x-auth-token': ADMIN_BOOTSTRAP_TOKEN
-      },
-      timeout: 8000
-    },
-    (res) => {
-      res.resume();
-      if (res.statusCode === 200) {
-        registered = true;
-        log('SYS', null, `Registered ${PUBLIC_HOST}:${PUBLIC_PORT} with Worker`);
-        setTimeout(sendHeartbeat, 1000).unref();
-      } else {
-        log('ERR', null, `Worker registration returned HTTP ${res.statusCode}`);
+/** @type {Map<string, { address: string, family: number, exp: number }>} */
+const dnsCache = new Map();
+const dnsInflight = new Map();
+
+function resolveCachedDns(host) {
+  const cleanHost = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+  const ipVer = net.isIP(cleanHost);
+  if (ipVer === 4 || ipVer === 6) {
+    return Promise.resolve({ address: cleanHost, family: ipVer });
+  }
+  const now = Date.now();
+  const cached = dnsCache.get(cleanHost);
+  if (cached && cached.exp > now) {
+    return Promise.resolve({ address: cached.address, family: cached.family });
+  }
+  const key = `${UPSTREAM_FAMILY}:${cleanHost}`;
+  if (dnsInflight.has(key)) return dnsInflight.get(key);
+
+  const p = new Promise((resolve, reject) => {
+    const opts = UPSTREAM_FAMILY === 4 || UPSTREAM_FAMILY === 6
+      ? { family: UPSTREAM_FAMILY, verbatim: false }
+      : { verbatim: false };
+    dns.lookup(cleanHost, opts, (err, address, family) => {
+      if (err || !address) {
+        if (UPSTREAM_FAMILY === 4) {
+          return dns.lookup(cleanHost, { verbatim: false }, (err2, addr2, fam2) => {
+            if (err2 || !addr2) return reject(err2 || err || new Error('ENOTFOUND'));
+            dnsCache.set(cleanHost, { address: addr2, family: fam2, exp: Date.now() + 60000 });
+            resolve({ address: addr2, family: fam2 });
+          });
+        }
+        return reject(err || new Error('ENOTFOUND'));
       }
-    }
-  );
-  req.on('error', (err) => log('ERR', null, `Worker registration error: ${err.message}`));
-  req.on('timeout', () => { req.destroy(); });
-  req.write(payload);
-  req.end();
+      dnsCache.set(cleanHost, { address, family, exp: Date.now() + 60000 });
+      resolve({ address, family });
+    });
+  }).finally(() => {
+    dnsInflight.delete(key);
+  });
+
+  dnsInflight.set(key, p);
+  return p;
 }
+
+function sendSafeUdp(id, tag, sock4, getSock6, payload, port, host, onDone) {
+  if (isBlockedTarget(host, port)) {
+    nodeMetrics.errors.blocked++;
+    if (onDone) onDone(new Error('BLOCKED_TARGET'));
+    return;
+  }
+  resolveCachedDns(host)
+    .then(({ address, family }) => {
+      if (isBlockedTarget(address, port)) {
+        nodeMetrics.errors.blocked++;
+        log('ERR', id, `${tag} blocked resolved private IP -> ${host} (${address}:${port})`);
+        if (onDone) onDone(new Error('BLOCKED_IP'));
+        return;
+      }
+      const targetSock = family === 6 ? (typeof getSock6 === 'function' ? getSock6() : getSock6) : sock4;
+      if (!targetSock) {
+        if (onDone) onDone(new Error('NO_UDP_SOCKET'));
+        return;
+      }
+      try {
+        targetSock.send(payload, port, address, (err) => {
+          if (err) {
+            nodeMetrics.errors.upstream++;
+            log('ERR', id, `${tag} send error -> ${host} (${address}:${port}): ${err.code || err.message}`);
+          }
+          if (onDone) onDone(err || null);
+        });
+      } catch (err) {
+        nodeMetrics.errors.upstream++;
+        if (onDone) onDone(err);
+      }
+    })
+    .catch((err) => {
+      nodeMetrics.errors.upstream++;
+      log('ERR', id, `${tag} DNS error -> ${host}:${port} (${err.code || err.message})`);
+      if (onDone) onDone(err);
+    });
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of dnsCache.entries()) {
+    if (v.exp <= now) dnsCache.delete(k);
+  }
+}, 120000).unref();
 
 const tokenCache = new Map();
 const pendingChecks = new Map();
@@ -342,75 +421,6 @@ function collectActiveClients() {
     .slice(0, 50);
 }
 
-let heartbeatInFlight = false;
-function sendHeartbeat() {
-  if (!PUBLIC_HOST || heartbeatInFlight) return;
-  if (!registered) registerRenderHost();
-  heartbeatInFlight = true;
-
-  const mem = process.memoryUsage();
-  const txSnap = nodeMetrics.txDelta;
-  const rxSnap = nodeMetrics.rxDelta;
-  const tokSnap = {};
-  for (const [tok, val] of tokenDeltas.entries()) {
-    tokSnap[tok] = { ...val };
-  }
-
-  const payload = JSON.stringify({
-    host: PUBLIC_HOST,
-    port: PUBLIC_PORT,
-    runtime: 'render',
-    uptimeSec: Math.floor(process.uptime()),
-    rssBytes: mem.rss,
-    heapUsedBytes: mem.heapUsed,
-    activeWs: wss.clients.size,
-    totalConns: nodeMetrics.totalConns,
-    txDelta: txSnap,
-    rxDelta: rxSnap,
-    errors: { ...nodeMetrics.errors },
-    clients: collectActiveClients(),
-    tokenDeltas: tokSnap
-  });
-
-  const req = https.request(
-    `${WORKER_BASE_URL}/api/heartbeat`,
-    {
-      method: 'POST',
-      agent: workerAgent,
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload),
-        'x-auth-token': ADMIN_BOOTSTRAP_TOKEN
-      },
-      timeout: 6000
-    },
-    (res) => {
-      res.resume();
-      heartbeatInFlight = false;
-      if (res.statusCode === 200) {
-        nodeMetrics.txDelta = Math.max(0, nodeMetrics.txDelta - txSnap);
-        nodeMetrics.rxDelta = Math.max(0, nodeMetrics.rxDelta - rxSnap);
-        for (const [tok, sent] of Object.entries(tokSnap)) {
-          const cur = tokenDeltas.get(tok);
-          if (!cur) continue;
-          cur.tx = Math.max(0, cur.tx - sent.tx);
-          cur.rx = Math.max(0, cur.rx - sent.rx);
-          cur.conns = Math.max(0, cur.conns - sent.conns);
-          if (cur.tx === 0 && cur.rx === 0 && cur.conns === 0) {
-            tokenDeltas.delete(tok);
-          }
-        }
-      }
-    }
-  );
-  req.on('error', () => { heartbeatInFlight = false; });
-  req.on('timeout', () => { heartbeatInFlight = false; req.destroy(); });
-  req.write(payload);
-  req.end();
-}
-
-setInterval(sendHeartbeat, 30000).unref();
-
 function formatIpv6(buf, offset) {
   const parts = [];
   for (let i = 0; i < 16; i += 2) {
@@ -419,50 +429,117 @@ function formatIpv6(buf, offset) {
   return parts.join(':');
 }
 
+function parseVlessAddress(buf, offset) {
+  if (buf.length < offset + 1) return null;
+  const addrType = buf[offset++];
+  let host = '';
+  if (addrType === 1) {
+    if (buf.length < offset + 4) return null;
+    host = `${buf[offset]}.${buf[offset + 1]}.${buf[offset + 2]}.${buf[offset + 3]}`;
+    offset += 4;
+  } else if (addrType === 2) {
+    if (buf.length < offset + 1) return null;
+    const len = buf[offset++];
+    if (buf.length < offset + len) return null;
+    host = buf.subarray(offset, offset + len).toString('utf8');
+    offset += len;
+  } else if (addrType === 3) {
+    if (buf.length < offset + 16) return null;
+    host = formatIpv6(buf, offset);
+    offset += 16;
+  } else {
+    return { error: `addrType=${addrType}` };
+  }
+  return { host, nextOffset: offset };
+}
+
+function encodeMuxAddress(ip) {
+  const ver = net.isIP(ip);
+  if (ver === 4) {
+    const p = ip.split('.').map(Number);
+    return Buffer.from([0x01, p[0], p[1], p[2], p[3]]);
+  }
+  if (ver === 6) {
+    const words = parseIpv6Words(ip);
+    if (words) {
+      const b = Buffer.allocUnsafe(17);
+      b[0] = 0x03;
+      for (let i = 0; i < 8; i++) b.writeUInt16BE(words[i], 1 + i * 2);
+      return b;
+    }
+  }
+  const strBuf = Buffer.from(String(ip || '0.0.0.0'), 'utf8');
+  return Buffer.concat([Buffer.from([0x02, strBuf.length]), strBuf]);
+}
+
 function connectUpstreamTcp(id, tag, host, port, onConnect, onFail) {
-  const isIpv6Literal = host.includes(':');
-  const isIpv4Literal = /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
-  const options = {
-    host,
-    port,
-    family: isIpv6Literal ? 6 : (isIpv4Literal ? 4 : 0),
-    autoSelectFamily: !isIpv6Literal && !isIpv4Literal,
-    autoSelectFamilyAttemptTimeout: 250
-  };
+  let destroyed = false;
+  let socket = null;
 
-  const socket = net.connect(options);
-  socket.setNoDelay(true);
-  socket.setKeepAlive(true, 15000);
-
-  let connected = false;
   const connectTimer = setTimeout(() => {
-    if (!connected) {
+    if (!destroyed) {
+      destroyed = true;
       nodeMetrics.errors.timeout++;
       log('ERR', id, `${tag} connect timeout -> ${host}:${port}`);
-      socket.destroy();
+      if (socket) socket.destroy();
       onFail(new Error('CONNECT_TIMEOUT'));
     }
-  }, 5000);
+  }, 3500);
 
-  socket.once('connect', () => {
-    connected = true;
-    clearTimeout(connectTimer);
-    socket.setTimeout(300000);
-    socket.on('timeout', () => socket.destroy());
-    onConnect(socket);
-  });
+  resolveCachedDns(host)
+    .then(({ address, family }) => {
+      if (destroyed) return;
+      if (isBlockedTarget(address, port)) {
+        destroyed = true;
+        clearTimeout(connectTimer);
+        nodeMetrics.errors.blocked++;
+        log('ERR', id, `${tag} blocked resolved private IP -> ${host} (${address}:${port})`);
+        return onFail(new Error('BLOCKED_IP'));
+      }
 
-  socket.on('error', (err) => {
-    clearTimeout(connectTimer);
-    if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') {
+      socket = net.connect({ host: address, port, family });
+      socket.setNoDelay(true);
+      socket.setKeepAlive(true, 15000);
+
+      let connected = false;
+      socket.once('connect', () => {
+        if (destroyed) return socket.destroy();
+        connected = true;
+        clearTimeout(connectTimer);
+        socket.setTimeout(300000);
+        socket.on('timeout', () => socket.destroy());
+        onConnect(socket);
+      });
+
+      socket.on('error', (err) => {
+        clearTimeout(connectTimer);
+        if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') {
+          nodeMetrics.errors.upstream++;
+          log('ERR', id, `${tag} upstream error -> ${host}:${port} (${err.code || err.message})`);
+        }
+        socket.destroy();
+        if (!connected && !destroyed) {
+          destroyed = true;
+          onFail(err);
+        }
+      });
+    })
+    .catch((err) => {
+      if (destroyed) return;
+      destroyed = true;
+      clearTimeout(connectTimer);
       nodeMetrics.errors.upstream++;
       log('ERR', id, `${tag} upstream error -> ${host}:${port} (${err.code || err.message})`);
-    }
-    socket.destroy();
-    if (!connected) onFail(err);
-  });
+      onFail(err);
+    });
 
-  return socket;
+  return {
+    destroy() {
+      destroyed = true;
+      clearTimeout(connectTimer);
+      if (socket && !socket.destroyed) socket.destroy();
+    }
+  };
 }
 
 function writeChunkedToTcp(sock, buf) {
@@ -605,8 +682,8 @@ function pumpBidirectional(ws, sock, earlyPayload, pendingChunks, onTxBytes, onR
 }
 
 function handleVlessUdp(ws, id, version, targetHost, targetPort, initialPayload) {
-  const isIpv6 = targetHost.includes(':');
-  const udpSocket = dgram.createSocket(isIpv6 ? 'udp6' : 'udp4');
+  let udp4 = null;
+  let udp6 = null;
   let rxBuffer = EMPTY_BUF;
   let lastActivity = Date.now();
   let closed = false;
@@ -618,9 +695,58 @@ function handleVlessUdp(ws, id, version, targetHost, targetPort, initialPayload)
     closed = true;
     clearInterval(idleTimer);
     rxBuffer = EMPTY_BUF;
-    try { udpSocket.close(); } catch {}
+    if (udp4) {
+      try { udp4.close(); } catch {}
+      udp4 = null;
+    }
+    if (udp6) {
+      try { udp6.close(); } catch {}
+      udp6 = null;
+    }
     if (ws.readyState === WebSocket.OPEN) ws.close();
   };
+
+  const attachUdpListeners = (sock) => {
+    sock.on('message', (msg) => {
+      if (closed) return;
+      lastActivity = Date.now();
+      if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 262144) {
+        nodeMetrics.errors.udpDrop++;
+        return;
+      }
+      recordTraffic(ws, 'rx', msg.length);
+      const frame = Buffer.allocUnsafe(2 + msg.length);
+      frame.writeUInt16BE(msg.length, 0);
+      msg.copy(frame, 2);
+      ws.send(frame, { binary: true });
+    });
+    sock.on('error', (err) => {
+      if (!closed) {
+        nodeMetrics.errors.upstream++;
+        log('ERR', id, `VLESS-UDP socket error -> ${targetHost}:${targetPort}: ${err.code || err.message}`);
+      }
+      cleanup();
+    });
+  };
+
+  const getUdp4 = () => {
+    if (!udp4 && !closed) {
+      udp4 = dgram.createSocket('udp4');
+      attachUdpListeners(udp4);
+    }
+    return udp4;
+  };
+
+  const getUdp6 = () => {
+    if (!udp6 && !closed) {
+      udp6 = dgram.createSocket('udp6');
+      attachUdpListeners(udp6);
+    }
+    return udp6;
+  };
+
+  if (targetHost.includes(':')) getUdp6();
+  else getUdp4();
 
   const idleTimer = setInterval(() => {
     if (Date.now() - lastActivity > 60000) cleanup();
@@ -645,13 +771,9 @@ function handleVlessUdp(ws, id, version, targetHost, targetPort, initialPayload)
       const datagram = rxBuffer.subarray(offset + 2, offset + 2 + pktLen);
       offset += 2 + pktLen;
       if (datagram.length > 0 && !closed) {
-        recordTraffic(ws, 'tx', datagram.length);
-        udpSocket.send(datagram, targetPort, targetHost, (err) => {
-          if (err && !closed) {
-            nodeMetrics.errors.upstream++;
-            log('ERR', id, `VLESS-UDP send error -> ${targetHost}:${targetPort}: ${err.code || err.message}`);
-          }
-        });
+        const packetCopy = Buffer.from(datagram);
+        recordTraffic(ws, 'tx', packetCopy.length);
+        sendSafeUdp(id, 'VLESS-UDP', getUdp4(), getUdp6, packetCopy, targetPort, targetHost);
       }
     }
 
@@ -663,28 +785,6 @@ function handleVlessUdp(ws, id, version, targetHost, targetPort, initialPayload)
   ws.on('message', (data) => {
     flushFrames(Buffer.isBuffer(data) ? data : Buffer.from(data));
   });
-
-  udpSocket.on('message', (msg) => {
-    if (closed) return;
-    lastActivity = Date.now();
-    if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 262144) {
-      nodeMetrics.errors.udpDrop++;
-      return;
-    }
-    recordTraffic(ws, 'rx', msg.length);
-    const frame = Buffer.allocUnsafe(2 + msg.length);
-    frame.writeUInt16BE(msg.length, 0);
-    msg.copy(frame, 2);
-    ws.send(frame, { binary: true });
-  });
-
-  udpSocket.on('error', (err) => {
-    if (!closed) {
-      nodeMetrics.errors.upstream++;
-      log('ERR', id, `VLESS-UDP socket error -> ${targetHost}:${targetPort}: ${err.code || err.message}`);
-    }
-    cleanup();
-  });
   ws.on('error', cleanup);
   ws.on('close', cleanup);
 
@@ -692,6 +792,379 @@ function handleVlessUdp(ws, id, version, targetHost, targetPort, initialPayload)
   ws.send(respHeader, { binary: true }, (err) => {
     if (err) return cleanup();
     flushFrames(initialPayload);
+  });
+}
+
+/**
+ * VLESS MuxCool (cmd=0x03) demultiplexer for clients that enable Mux (e.g. v2rayN)
+ */
+function handleVlessMux(ws, id, version, initialPayload) {
+  /** @type {Map<number, { type: 'tcp'|'udp', sock?: any, udp4?: dgram.Socket, udp6?: dgram.Socket, drainTimer?: any, host: string, port: number, hasAddrMeta?: boolean, globalId?: Buffer, lastActive: number, pending: Buffer[], pendingBytes: number, connected: boolean, closed: boolean }>} */
+  const sessions = new Map();
+  let muxBuf = EMPTY_BUF;
+  let closed = false;
+
+  log('VLESS-MUX', id, 'Opened MuxCool session');
+
+  const sendMuxControl = (sessionId, status, opt = 0x00) => {
+    if (closed || ws.readyState !== WebSocket.OPEN) return;
+    const frame = Buffer.allocUnsafe(6);
+    frame.writeUInt16BE(4, 0);
+    frame.writeUInt16BE(sessionId, 2);
+    frame[4] = status;
+    frame[5] = opt;
+    ws.send(frame, { binary: true });
+  };
+
+  const sendMuxTcpData = (sessionId, data) => {
+    if (closed || ws.readyState !== WebSocket.OPEN || !data || data.length === 0) return;
+    recordTraffic(ws, 'rx', data.length);
+    for (let off = 0; off < data.length; off += MAX_CHUNK) {
+      const slice = data.subarray(off, off + MAX_CHUNK);
+      const frame = Buffer.allocUnsafe(8 + slice.length);
+      frame.writeUInt16BE(4, 0);
+      frame.writeUInt16BE(sessionId, 2);
+      frame[4] = 0x02; // SessionStatusKeep
+      frame[5] = 0x01; // OptionData
+      frame.writeUInt16BE(slice.length, 6);
+      slice.copy(frame, 8);
+      ws.send(frame, { binary: true });
+    }
+  };
+
+  const sendMuxUdpData = (sess, sessionId, msg, rinfo) => {
+    if (closed || sess.closed || ws.readyState !== WebSocket.OPEN || !msg || msg.length === 0) return;
+    recordTraffic(ws, 'rx', msg.length);
+    if (sess.hasAddrMeta && rinfo && rinfo.address && rinfo.port) {
+      const addrBytes = encodeMuxAddress(rinfo.address);
+      const metaLen = 4 + 1 + 2 + addrBytes.length;
+      const frame = Buffer.allocUnsafe(2 + metaLen + 2 + msg.length);
+      frame.writeUInt16BE(metaLen, 0);
+      frame.writeUInt16BE(sessionId, 2);
+      frame[4] = 0x02; // SessionStatusKeep
+      frame[5] = 0x01; // OptionData
+      frame[6] = 0x02; // Network UDP
+      frame.writeUInt16BE(rinfo.port, 7);
+      addrBytes.copy(frame, 9);
+      const dataLenOff = 2 + metaLen;
+      frame.writeUInt16BE(msg.length, dataLenOff);
+      msg.copy(frame, dataLenOff + 2);
+      ws.send(frame, { binary: true });
+    } else {
+      const frame = Buffer.allocUnsafe(8 + msg.length);
+      frame.writeUInt16BE(4, 0);
+      frame.writeUInt16BE(sessionId, 2);
+      frame[4] = 0x02;
+      frame[5] = 0x01;
+      frame.writeUInt16BE(msg.length, 6);
+      msg.copy(frame, 8);
+      ws.send(frame, { binary: true });
+    }
+  };
+
+  const closeSession = (sessionId, notifyClient = true, isError = false) => {
+    const s = sessions.get(sessionId);
+    if (!s || s.closed) return;
+    s.closed = true;
+    sessions.delete(sessionId);
+    if (s.drainTimer) {
+      clearInterval(s.drainTimer);
+      s.drainTimer = null;
+    }
+    s.pending.length = 0;
+    s.pendingBytes = 0;
+    if (s.sock) {
+      try { s.sock.destroy(); } catch {}
+      s.sock = null;
+    }
+    if (s.udp4) {
+      try { s.udp4.close(); } catch {}
+      s.udp4 = null;
+    }
+    if (s.udp6) {
+      try { s.udp6.close(); } catch {}
+      s.udp6 = null;
+    }
+    if (notifyClient) sendMuxControl(sessionId, 0x03, isError ? 0x02 : 0x00);
+  };
+
+  const udpGcTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [sid, s] of sessions.entries()) {
+      if (s.type === 'udp' && now - s.lastActive > 60000) {
+        closeSession(sid, true, false);
+      }
+    }
+  }, 15000);
+  udpGcTimer.unref();
+
+  const cleanupAll = () => {
+    if (closed) return;
+    closed = true;
+    clearInterval(udpGcTimer);
+    muxBuf = EMPTY_BUF;
+    for (const sid of Array.from(sessions.keys())) {
+      closeSession(sid, false, false);
+    }
+    if (ws.readyState === WebSocket.OPEN) ws.close();
+  };
+
+  const openMuxTcpSession = (sessionId, host, port, firstData) => {
+    if (sessions.has(sessionId)) {
+      closeSession(sessionId, false, false);
+    }
+    if (sessions.size >= 64 || isBlockedTarget(host, port)) {
+      if (isBlockedTarget(host, port)) nodeMetrics.errors.blocked++;
+      return sendMuxControl(sessionId, 0x03, 0x02);
+    }
+    const firstBuf = firstData && firstData.length > 0 ? Buffer.from(firstData) : null;
+    const sess = {
+      type: 'tcp',
+      host,
+      port,
+      lastActive: Date.now(),
+      pending: firstBuf ? [firstBuf] : [],
+      pendingBytes: firstBuf ? firstBuf.length : 0,
+      connected: false,
+      closed: false,
+      drainTimer: null,
+      sock: null
+    };
+    sessions.set(sessionId, sess);
+
+    sess.sock = connectUpstreamTcp(
+      id,
+      `MUX#${sessionId}`,
+      host,
+      port,
+      (sock) => {
+        if (closed || sess.closed) return sock.destroy();
+        sess.sock = sock;
+        sess.connected = true;
+        sess.lastActive = Date.now();
+        for (const chunk of sess.pending) {
+          recordTraffic(ws, 'tx', chunk.length);
+          writeChunkedToTcp(sock, chunk);
+        }
+        sess.pending.length = 0;
+        sess.pendingBytes = 0;
+
+        sock.on('drain', () => {
+          if (!closed && ws.readyState === WebSocket.OPEN) resumeWsReceiver(ws);
+        });
+
+        sock.on('data', (chunk) => {
+          sess.lastActive = Date.now();
+          sendMuxTcpData(sessionId, chunk);
+          if (ws.bufferedAmount > 512 * 1024 && !sock.destroyed) {
+            sock.pause();
+            if (!sess.drainTimer) {
+              sess.drainTimer = setInterval(() => {
+                if (closed || sess.closed || sock.destroyed || ws.bufferedAmount < 128 * 1024) {
+                  clearInterval(sess.drainTimer);
+                  sess.drainTimer = null;
+                  if (!sock.destroyed && !closed && !sess.closed) sock.resume();
+                }
+              }, 20);
+              sess.drainTimer.unref();
+            }
+          }
+        });
+        sock.on('end', () => closeSession(sessionId, true, false));
+        sock.on('close', () => closeSession(sessionId, true, false));
+      },
+      () => closeSession(sessionId, true, true)
+    );
+  };
+
+  const openMuxUdpSession = (sessionId, host, port, firstData, hasAddrMeta, globalId) => {
+    if (sessions.has(sessionId)) {
+      closeSession(sessionId, false, false);
+    }
+    if (sessions.size >= 64 || isBlockedTarget(host, port)) {
+      if (isBlockedTarget(host, port)) nodeMetrics.errors.blocked++;
+      return sendMuxControl(sessionId, 0x03, 0x02);
+    }
+
+    const sess = {
+      type: 'udp',
+      udp4: null,
+      udp6: null,
+      host,
+      port,
+      hasAddrMeta: Boolean(hasAddrMeta),
+      globalId: globalId || null,
+      lastActive: Date.now(),
+      pending: [],
+      pendingBytes: 0,
+      connected: true,
+      closed: false
+    };
+
+    const bindUdpListeners = (sock) => {
+      sock.on('message', (msg, rinfo) => {
+        if (closed || sess.closed) return;
+        sess.lastActive = Date.now();
+        if (ws.bufferedAmount > 262144) {
+          nodeMetrics.errors.udpDrop++;
+          return;
+        }
+        sendMuxUdpData(sess, sessionId, msg, rinfo);
+      });
+      sock.on('error', () => closeSession(sessionId, true, true));
+    };
+
+    const getUdp4 = () => {
+      if (!sess.udp4 && !closed && !sess.closed) {
+        sess.udp4 = dgram.createSocket('udp4');
+        bindUdpListeners(sess.udp4);
+      }
+      return sess.udp4;
+    };
+
+    const getUdp6 = () => {
+      if (!sess.udp6 && !closed && !sess.closed) {
+        sess.udp6 = dgram.createSocket('udp6');
+        bindUdpListeners(sess.udp6);
+      }
+      return sess.udp6;
+    };
+
+    if (host.includes(':')) getUdp6();
+    else getUdp4();
+
+    sess.getUdp4 = getUdp4;
+    sess.getUdp6 = getUdp6;
+    sessions.set(sessionId, sess);
+
+    if (firstData && firstData.length > 0) {
+      const copy = Buffer.from(firstData);
+      recordTraffic(ws, 'tx', copy.length);
+      sendSafeUdp(id, `MUX-UDP#${sessionId}`, getUdp4(), getUdp6, copy, port, host);
+    }
+  };
+
+  const consumeMux = (chunk) => {
+    if (closed) return;
+    if (chunk && chunk.length > 0) {
+      if (muxBuf.length + chunk.length > 524288) {
+        log('ERR', id, 'VLESS-MUX buffer overflow');
+        return cleanupAll();
+      }
+      muxBuf = muxBuf.length === 0 ? chunk : Buffer.concat([muxBuf, chunk]);
+    }
+
+    let offset = 0;
+    while (muxBuf.length - offset >= 2) {
+      const metaLen = muxBuf.readUInt16BE(offset);
+      if (metaLen < 4 || metaLen > 512) {
+        log('ERR', id, `VLESS-MUX invalid metaLen=${metaLen}`);
+        return cleanupAll();
+      }
+      if (muxBuf.length - offset < 2 + metaLen) break;
+
+      const metaStart = offset + 2;
+      const metaEnd = metaStart + metaLen;
+      const sessionId = muxBuf.readUInt16BE(metaStart);
+      const status = muxBuf[metaStart + 2];
+      const option = muxBuf[metaStart + 3];
+      const hasData = (option & 0x01) !== 0;
+
+      let frameEnd = metaEnd;
+      let payload = EMPTY_BUF;
+      if (hasData) {
+        if (muxBuf.length < frameEnd + 2) break;
+        const dataLen = muxBuf.readUInt16BE(frameEnd);
+        if (muxBuf.length < frameEnd + 2 + dataLen) break;
+        payload = muxBuf.subarray(frameEnd + 2, frameEnd + 2 + dataLen);
+        frameEnd += 2 + dataLen;
+      }
+
+      offset = frameEnd;
+
+      if (status === 0x04) {
+        // KeepAlive
+        continue;
+      }
+      if (status === 0x01) {
+        // New session: network(1) + port(2) + addrType(1) + addr [+ optional 8B XUDP GlobalID]
+        if (metaLen < 8) {
+          sendMuxControl(sessionId, 0x03, 0x02);
+          continue;
+        }
+        const netType = muxBuf[metaStart + 4];
+        const port = muxBuf.readUInt16BE(metaStart + 5);
+        const parsedAddr = parseVlessAddress(muxBuf.subarray(0, metaEnd), metaStart + 7);
+        if (!parsedAddr || parsedAddr.error) {
+          sendMuxControl(sessionId, 0x03, 0x02);
+          continue;
+        }
+        if (netType === 0x01) {
+          openMuxTcpSession(sessionId, parsedAddr.host, port, payload);
+        } else if (netType === 0x02) {
+          const hasGlobalId = (metaEnd - parsedAddr.nextOffset) >= 8;
+          const globalId = hasGlobalId ? Buffer.from(muxBuf.subarray(parsedAddr.nextOffset, parsedAddr.nextOffset + 8)) : null;
+          openMuxUdpSession(sessionId, parsedAddr.host, port, payload, true, globalId);
+        } else {
+          sendMuxControl(sessionId, 0x03, 0x02);
+        }
+      } else if (status === 0x02) {
+        // Keep (data frame or XUDP per-packet target override)
+        const sess = sessions.get(sessionId);
+        if (!sess || sess.closed) continue;
+        sess.lastActive = Date.now();
+        if (payload.length > 0) {
+          if (sess.type === 'tcp') {
+            if (sess.connected && sess.sock) {
+              recordTraffic(ws, 'tx', payload.length);
+              if (!writeChunkedToTcp(sess.sock, payload)) {
+                pauseWsReceiver(ws);
+              }
+            } else if (sess.pending.length < 32 && sess.pendingBytes + payload.length <= 262144) {
+              sess.pending.push(Buffer.from(payload));
+              sess.pendingBytes += payload.length;
+            } else {
+              closeSession(sessionId, true, true);
+            }
+          } else if (sess.type === 'udp') {
+            let destHost = sess.host;
+            let destPort = sess.port;
+            if (metaLen >= 8 && muxBuf[metaStart + 4] === 0x02) {
+              sess.hasAddrMeta = true;
+              const overridePort = muxBuf.readUInt16BE(metaStart + 5);
+              const pAddr = parseVlessAddress(muxBuf.subarray(0, metaEnd), metaStart + 7);
+              if (!pAddr || pAddr.error || isBlockedTarget(pAddr.host, overridePort)) {
+                nodeMetrics.errors.blocked++;
+                continue;
+              }
+              destHost = pAddr.host;
+              destPort = overridePort;
+            }
+            const copy = Buffer.from(payload);
+            recordTraffic(ws, 'tx', copy.length);
+            sendSafeUdp(id, `MUX-UDP#${sessionId}`, sess.getUdp4(), sess.getUdp6, copy, destPort, destHost);
+          }
+        }
+      } else if (status === 0x03) {
+        closeSession(sessionId, false, false);
+      }
+    }
+
+    if (offset > 0) {
+      muxBuf = offset === muxBuf.length ? EMPTY_BUF : muxBuf.subarray(offset);
+    }
+  };
+
+  ws.on('message', (data) => {
+    consumeMux(Buffer.isBuffer(data) ? data : Buffer.from(data));
+  });
+  ws.on('error', cleanupAll);
+  ws.on('close', cleanupAll);
+
+  const respHeader = version === 0x00 ? VLESS_RESP_HEADER : Buffer.from([version, 0x00]);
+  ws.send(respHeader, { binary: true }, (err) => {
+    if (err) return cleanupAll();
+    consumeMux(initialPayload);
   });
 }
 
@@ -704,7 +1177,7 @@ function handleVlessConnection(ws, id) {
   ws.once('message', (msg) => {
     clearTimeout(handshakeTimer);
     const buf = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
-    if (buf.length < 24 || buf[0] !== 0x00) {
+    if (buf.length < 19 || buf[0] !== 0x00) {
       log('ERR', id, `VLESS invalid header (len=${buf.length}, ver=${buf[0]})`);
       return ws.close();
     }
@@ -717,32 +1190,28 @@ function handleVlessConnection(ws, id) {
     }
 
     let offset = 18 + buf[17];
-    if (buf.length < offset + 4) return ws.close();
+    if (buf.length < offset + 1) return ws.close();
 
     const cmd = buf[offset++];
+
+    // VLESS Mux (cmd=0x03) omits port & address in the outer header
+    if (cmd === 0x03) {
+      return handleVlessMux(ws, id, version, buf.subarray(offset));
+    }
+
+    if (buf.length < offset + 4) return ws.close();
     const targetPort = buf.readUInt16BE(offset);
     offset += 2;
-    const addrType = buf[offset++];
-    let targetHost = '';
 
-    if (addrType === 1) {
-      if (buf.length < offset + 4) return ws.close();
-      targetHost = `${buf[offset]}.${buf[offset + 1]}.${buf[offset + 2]}.${buf[offset + 3]}`;
-      offset += 4;
-    } else if (addrType === 2) {
-      if (buf.length < offset + 1) return ws.close();
-      const len = buf[offset++];
-      if (buf.length < offset + len) return ws.close();
-      targetHost = buf.subarray(offset, offset + len).toString('utf8');
-      offset += len;
-    } else if (addrType === 3) {
-      if (buf.length < offset + 16) return ws.close();
-      targetHost = formatIpv6(buf, offset);
-      offset += 16;
-    } else {
-      log('ERR', id, `VLESS unsupported addrType=${addrType}`);
+    const parsedAddr = parseVlessAddress(buf, offset);
+    if (!parsedAddr) return ws.close();
+    if (parsedAddr.error) {
+      log('ERR', id, `VLESS unsupported ${parsedAddr.error}`);
       return ws.close();
     }
+
+    const targetHost = parsedAddr.host;
+    offset = parsedAddr.nextOffset;
 
     if (isBlockedTarget(targetHost, targetPort)) {
       nodeMetrics.errors.blocked++;
@@ -853,6 +1322,111 @@ function parseUpgradeUrl(rawUrl) {
   return { pathname, token };
 }
 
+function registerRenderHost() {
+  if (!PUBLIC_HOST) return;
+  const payload = JSON.stringify({
+    host: PUBLIC_HOST,
+    port: PUBLIC_PORT,
+    replaceHost: true
+  });
+  const req = https.request(
+    `${WORKER_BASE_URL}/api/register`,
+    {
+      method: 'POST',
+      agent: workerAgent,
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+        'x-auth-token': ADMIN_BOOTSTRAP_TOKEN
+      },
+      timeout: 8000
+    },
+    (res) => {
+      res.resume();
+      if (res.statusCode === 200) {
+        registered = true;
+        log('SYS', null, `Registered ${PUBLIC_HOST}:${PUBLIC_PORT} with Worker`);
+        setTimeout(sendHeartbeat, 1000).unref();
+      } else {
+        log('ERR', null, `Worker registration returned HTTP ${res.statusCode}`);
+      }
+    }
+  );
+  req.on('error', (err) => log('ERR', null, `Worker registration error: ${err.message}`));
+  req.on('timeout', () => { req.destroy(); });
+  req.write(payload);
+  req.end();
+}
+
+let heartbeatInFlight = false;
+function sendHeartbeat() {
+  if (!PUBLIC_HOST || heartbeatInFlight) return;
+  if (!registered) registerRenderHost();
+  heartbeatInFlight = true;
+
+  const mem = process.memoryUsage();
+  const txSnap = nodeMetrics.txDelta;
+  const rxSnap = nodeMetrics.rxDelta;
+  const tokSnap = {};
+  for (const [tok, val] of tokenDeltas.entries()) {
+    tokSnap[tok] = { ...val };
+  }
+
+  const payload = JSON.stringify({
+    host: PUBLIC_HOST,
+    port: PUBLIC_PORT,
+    runtime: 'render',
+    uptimeSec: Math.floor(process.uptime()),
+    rssBytes: mem.rss,
+    heapUsedBytes: mem.heapUsed,
+    activeWs: wss.clients.size,
+    totalConns: nodeMetrics.totalConns,
+    txDelta: txSnap,
+    rxDelta: rxSnap,
+    errors: { ...nodeMetrics.errors },
+    clients: collectActiveClients(),
+    tokenDeltas: tokSnap
+  });
+
+  const req = https.request(
+    `${WORKER_BASE_URL}/api/heartbeat`,
+    {
+      method: 'POST',
+      agent: workerAgent,
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+        'x-auth-token': ADMIN_BOOTSTRAP_TOKEN
+      },
+      timeout: 6000
+    },
+    (res) => {
+      res.resume();
+      heartbeatInFlight = false;
+      if (res.statusCode === 200) {
+        nodeMetrics.txDelta = Math.max(0, nodeMetrics.txDelta - txSnap);
+        nodeMetrics.rxDelta = Math.max(0, nodeMetrics.rxDelta - rxSnap);
+        for (const [tok, sent] of Object.entries(tokSnap)) {
+          const cur = tokenDeltas.get(tok);
+          if (!cur) continue;
+          cur.tx = Math.max(0, cur.tx - sent.tx);
+          cur.rx = Math.max(0, cur.rx - sent.rx);
+          cur.conns = Math.max(0, cur.conns - sent.conns);
+          if (cur.tx === 0 && cur.rx === 0 && cur.conns === 0) {
+            tokenDeltas.delete(tok);
+          }
+        }
+      }
+    }
+  );
+  req.on('error', () => { heartbeatInFlight = false; });
+  req.on('timeout', () => { heartbeatInFlight = false; req.destroy(); });
+  req.write(payload);
+  req.end();
+}
+
+setInterval(sendHeartbeat, 30000).unref();
+
 function extractClientIp(request) {
   const direct = request.headers['true-client-ip'] || request.headers['cf-connecting-ip'];
   if (typeof direct === 'string' && direct.trim()) {
@@ -909,6 +1483,11 @@ httpServer.on('upgrade', async (request, socket, head) => {
   socket.on('error', () => socket.destroy());
   socket.setNoDelay(true);
 
+  if (wss.clients.size >= MAX_TOTAL_CONNS) {
+    if (socket.writable) socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
+    return socket.destroy();
+  }
+
   const { pathname, token: queryToken } = parseUpgradeUrl(request.url);
   const token = request.headers['x-relay-token'] || queryToken;
   const clientIp = extractClientIp(request);
@@ -920,9 +1499,33 @@ httpServer.on('upgrade', async (request, socket, head) => {
     return socket.destroy();
   }
 
+  if (socket.destroyed || !socket.writable) {
+    return socket.destroy();
+  }
+
+  if (wss.clients.size >= MAX_TOTAL_CONNS) {
+    socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
+    return socket.destroy();
+  }
+
+  if ((activeTokenConns.get(token) || 0) >= MAX_CONNS_PER_TOKEN) {
+    socket.write('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n');
+    return socket.destroy();
+  }
+
   if (pathname === '/vless') {
+    incrementTokenConns(token);
+    let decDone = false;
+    const safeDec = () => {
+      if (decDone) return;
+      decDone = true;
+      decrementTokenConns(token);
+    };
+    socket.once('close', safeDec);
+
     wss.handleUpgrade(request, socket, head, (ws) => {
       ws.meta = { ip: clientIp, token, connectedAt: Date.now(), tx: 0, rx: 0 };
+      ws.once('close', safeDec);
       recordConnOpen(token);
       handleVlessConnection(ws, id);
     });
