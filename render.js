@@ -5,6 +5,8 @@
  * - Supports VLESS TCP (0x01), UDP (0x02), and MuxCool/XUDP (0x03) with post-DNS SSRF protection
  * - Set LOG_VERBOSE=1 to log every TCP/UDP dial; defaults to [SYS] and [ERR] only
  */
+(function bootstrap() {
+const fs = require('fs');
 const http = require('http');
 const dns = require('dns');
 const net = require('net');
@@ -12,6 +14,176 @@ const dgram = require('dgram');
 const https = require('https');
 const crypto = require('crypto');
 const WebSocket = require('ws');
+
+const os = require('os');
+const { spawn } = require('child_process');
+
+function detectContainerMemoryBytes() {
+  const envMb = Number(process.env.MEMORY_LIMIT_MB || 0);
+  if (Number.isFinite(envMb) && envMb >= 32) {
+    return Math.round(envMb * 1024 * 1024);
+  }
+  const sysTotal = os.totalmem();
+  let detected = sysTotal;
+
+  // cgroups v2 (memory.max & memory.high)
+  for (const cgPath of ['/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory.high']) {
+    try {
+      const raw = fs.readFileSync(cgPath, 'utf8').trim();
+      if (raw && raw !== 'max') {
+        const val = Number(raw);
+        if (Number.isFinite(val) && val >= 32 * 1024 * 1024 && val < detected) {
+          detected = val;
+        }
+      }
+    } catch {}
+  }
+
+  // cgroups v1 fallback (memory.limit_in_bytes)
+  try {
+    const raw = fs.readFileSync('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'utf8').trim();
+    if (raw) {
+      const val = Number(raw);
+      if (Number.isFinite(val) && val >= 32 * 1024 * 1024 && val < detected) {
+        detected = val;
+      }
+    }
+  } catch {}
+
+  return detected;
+}
+
+const MEM_LIMIT_BYTES = detectContainerMemoryBytes();
+const MEM_LIMIT_MB = Math.max(32, Math.round(MEM_LIMIT_BYTES / (1024 * 1024)));
+
+// Auto-tune V8 old-space heap limit on constrained containers (<= 512 MB) before allocating runtime state
+if (
+  MEM_LIMIT_MB <= 512 &&
+  process.env.VLESS_HEAP_TUNED !== '1' &&
+  process.env.DISABLE_HEAP_TUNE !== '1'
+) {
+  const heapMb = Math.max(28, Math.min(240, Math.floor((MEM_LIMIT_MB - 36) * 0.62)));
+  const child = spawn(
+    process.execPath,
+    [`--max-old-space-size=${heapMb}`, '--expose-gc', ...process.argv.slice(1)],
+    {
+      stdio: 'inherit',
+      env: { ...process.env, VLESS_HEAP_TUNED: '1' }
+    }
+  );
+  const forwardSig = (sig) => {
+    try { child.kill(sig); } catch {}
+  };
+  process.on('SIGTERM', () => forwardSig('SIGTERM'));
+  process.on('SIGINT', () => forwardSig('SIGINT'));
+  child.on('exit', (code, signal) => {
+    if (signal) process.exit(1);
+    process.exit(code ?? 0);
+  });
+  // Pause parent execution while child runs
+  setInterval(() => {}, 60000);
+  return;
+}
+
+function buildResourceProfile(memMb) {
+  if (memMb <= 128) {
+    const maxTotal = Number(process.env.MAX_TOTAL_CONNS || Math.max(24, Math.floor((memMb - 44) * 0.85)));
+    return {
+      tier: 'nano',
+      maxChunk: Number(process.env.MAX_WS_CHUNK || 8192),
+      maxPayload: 256 * 1024,
+      maxTotalConns: maxTotal,
+      maxConnsPerToken: Number(process.env.MAX_CONNS_PER_TOKEN || Math.max(12, Math.floor(maxTotal / 3))),
+      wsHighWater: 64 * 1024,
+      wsLowWater: 16 * 1024,
+      preconnectPause: 16 * 1024,
+      preconnectMax: 64 * 1024,
+      udpMaxBuffered: 64 * 1024,
+      udpRxMax: 64 * 1024,
+      muxMaxBuf: 128 * 1024,
+      muxMaxSessions: 24,
+      maxCacheEntries: 256,
+      workerMaxSockets: 4
+    };
+  }
+  if (memMb <= 256) {
+    const maxTotal = Number(process.env.MAX_TOTAL_CONNS || Math.max(96, Math.floor((memMb - 48) * 0.88)));
+    return {
+      tier: 'micro',
+      maxChunk: Number(process.env.MAX_WS_CHUNK || 16384),
+      maxPayload: 512 * 1024,
+      maxTotalConns: maxTotal,
+      maxConnsPerToken: Number(process.env.MAX_CONNS_PER_TOKEN || Math.max(32, Math.floor(maxTotal / 3))),
+      wsHighWater: 192 * 1024,
+      wsLowWater: 48 * 1024,
+      preconnectPause: 32 * 1024,
+      preconnectMax: 131072,
+      udpMaxBuffered: 131072,
+      udpRxMax: 131072,
+      muxMaxBuf: 262144,
+      muxMaxSessions: 48,
+      maxCacheEntries: 512,
+      workerMaxSockets: 6
+    };
+  }
+  const maxTotal = Number(process.env.MAX_TOTAL_CONNS || Math.min(512, Math.floor((memMb - 56) * 0.72)));
+  return {
+    tier: 'standard',
+    maxChunk: Number(process.env.MAX_WS_CHUNK || 16384),
+    maxPayload: 1024 * 1024,
+    maxTotalConns: maxTotal,
+    maxConnsPerToken: Number(process.env.MAX_CONNS_PER_TOKEN || Math.max(64, Math.floor(maxTotal / 3))),
+    wsHighWater: 512 * 1024,
+    wsLowWater: 128 * 1024,
+    preconnectPause: 65536,
+    preconnectMax: 262144,
+    udpMaxBuffered: 262144,
+    udpRxMax: 262144,
+    muxMaxBuf: 524288,
+    muxMaxSessions: 64,
+    maxCacheEntries: 1024,
+    workerMaxSockets: 8
+  };
+}
+
+const RES = buildResourceProfile(MEM_LIMIT_MB);
+const OOM_SOFT_BYTES = Math.floor(MEM_LIMIT_BYTES * 0.80);
+const OOM_HARD_BYTES = Math.floor(MEM_LIMIT_BYTES * 0.88);
+let memoryPressureActive = false;
+let lastMemWarnAt = 0;
+
+function trimBoundedMap(map, maxEntries) {
+  if (map.size <= maxEntries) return;
+  const excess = map.size - maxEntries;
+  let removed = 0;
+  for (const key of map.keys()) {
+    map.delete(key);
+    removed++;
+    if (removed >= excess) break;
+  }
+}
+
+function checkMemoryPressure() {
+  const rss = process.memoryUsage().rss;
+  if (rss >= OOM_SOFT_BYTES) {
+    trimBoundedMap(dnsCache, Math.floor(RES.maxCacheEntries / 2));
+    trimBoundedMap(tokenCache, Math.floor(RES.maxCacheEntries / 2));
+    if (typeof global.gc === 'function') {
+      try { global.gc(); } catch {}
+    }
+  }
+  const afterRss = process.memoryUsage().rss;
+  const wasActive = memoryPressureActive;
+  memoryPressureActive = afterRss >= OOM_HARD_BYTES;
+  if (memoryPressureActive && (!wasActive || Date.now() - lastMemWarnAt > 30000)) {
+    lastMemWarnAt = Date.now();
+    log('SYS', null, `Memory pressure guard active: RSS ${(afterRss / 1048576).toFixed(1)}/${MEM_LIMIT_MB}MB (pausing new upgrades)`);
+  }
+  return memoryPressureActive;
+}
+
+setInterval(checkMemoryPressure, 5000).unref();
+
 
 const PORT = Number(process.env.PORT || process.env.SERVER_PORT || 10000);
 const WORKER_BASE_URL = (process.env.WORKER_BASE_URL || 'https://connect.accopture.top').replace(/\/$/, '');
@@ -25,15 +197,15 @@ const VLESS_UUID = (process.env.VLESS_UUID || 'b831381d-6324-4d53-ad4f-8cda48b30
   .replace(/-/g, '')
   .toLowerCase();
 const VLESS_UUID_BYTES = Buffer.from(VLESS_UUID, 'hex');
-const MAX_CHUNK = Number(process.env.MAX_WS_CHUNK || 16384);
+const MAX_CHUNK = RES.maxChunk;
 const LOG_VERBOSE = process.env.LOG_VERBOSE === '1';
 
 let registered = false;
 
 const VLESS_RESP_HEADER = Buffer.from([0x00, 0x00]);
 const EMPTY_BUF = Buffer.alloc(0);
-const MAX_CONNS_PER_TOKEN = Number(process.env.MAX_CONNS_PER_TOKEN || 64);
-const MAX_TOTAL_CONNS = Number(process.env.MAX_TOTAL_CONNS || 256);
+const MAX_CONNS_PER_TOKEN = RES.maxConnsPerToken;
+const MAX_TOTAL_CONNS = RES.maxTotalConns;
 const UPSTREAM_FAMILY = Number(process.env.UPSTREAM_FAMILY || 4);
 const ALLOW_ALL_PORTS = process.env.ALLOW_ALL_PORTS === '1';
 
@@ -41,7 +213,7 @@ const BLOCKED_ABUSE_PORTS = new Set([21, 22, 23, 25, 69, 111, 135, 137, 138, 139
 
 const workerAgent = new https.Agent({
   keepAlive: true,
-  maxSockets: 8,
+  maxSockets: RES.workerMaxSockets,
   keepAliveMsecs: 30000
 });
 
@@ -95,6 +267,7 @@ function recordTraffic(ws, dir, bytes) {
     if (!entry) {
       entry = { tx: 0, rx: 0, conns: 0, lastSeen: now };
       tokenDeltas.set(tok, entry);
+      trimBoundedMap(tokenDeltas, RES.maxCacheEntries);
     }
     if (dir === 'tx') entry.tx += bytes;
     else entry.rx += bytes;
@@ -251,12 +424,14 @@ function resolveCachedDns(host) {
           return dns.lookup(cleanHost, { verbatim: false }, (err2, addr2, fam2) => {
             if (err2 || !addr2) return reject(err2 || err || new Error('ENOTFOUND'));
             dnsCache.set(cleanHost, { address: addr2, family: fam2, exp: Date.now() + 60000 });
+            trimBoundedMap(dnsCache, RES.maxCacheEntries);
             resolve({ address: addr2, family: fam2 });
           });
         }
         return reject(err || new Error('ENOTFOUND'));
       }
       dnsCache.set(cleanHost, { address, family, exp: Date.now() + 60000 });
+      trimBoundedMap(dnsCache, RES.maxCacheEntries);
       resolve({ address, family });
     });
   }).finally(() => {
@@ -331,6 +506,7 @@ function queryWorkerVerify(token) {
             freshUntil: now + 5 * 60 * 1000,
             staleUntil: now + 15 * 60 * 1000
           });
+          trimBoundedMap(tokenCache, RES.maxCacheEntries);
           resolve(true);
         } else {
           tokenCache.delete(token);
@@ -380,7 +556,7 @@ setInterval(() => {
 
 const wss = new WebSocket.Server({
   noServer: true,
-  maxPayload: 2 * 1024 * 1024,
+  maxPayload: RES.maxPayload,
   perMessageDeflate: false
 });
 
@@ -581,11 +757,11 @@ function pumpBidirectional(ws, sock, earlyPayload, pendingChunks, onTxBytes, onR
 
   const checkWsBackpressure = () => {
     if (ws.readyState !== WebSocket.OPEN) return;
-    if (ws.bufferedAmount > 512 * 1024) {
+    if (ws.bufferedAmount > RES.wsHighWater) {
       sock.pause();
       if (!drainTimer) {
         drainTimer = setInterval(() => {
-          if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount < 128 * 1024) {
+          if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount < RES.wsLowWater) {
             clearInterval(drainTimer);
             drainTimer = null;
             if (!sock.destroyed) sock.resume();
@@ -710,7 +886,7 @@ function handleVlessUdp(ws, id, version, targetHost, targetPort, initialPayload)
     sock.on('message', (msg) => {
       if (closed) return;
       lastActivity = Date.now();
-      if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 262144) {
+      if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > RES.udpMaxBuffered) {
         nodeMetrics.errors.udpDrop++;
         return;
       }
@@ -757,7 +933,7 @@ function handleVlessUdp(ws, id, version, targetHost, targetPort, initialPayload)
     if (closed) return;
     lastActivity = Date.now();
     if (chunk && chunk.length > 0) {
-      if (rxBuffer.length + chunk.length > 262144) {
+      if (rxBuffer.length + chunk.length > RES.udpRxMax) {
         log('ERR', id, 'VLESS-UDP rxBuffer overflow');
         return cleanup();
       }
@@ -885,6 +1061,16 @@ function handleVlessMux(ws, id, version, initialPayload) {
       try { s.udp6.close(); } catch {}
       s.udp6 = null;
     }
+    if (!closed && ws.readyState === WebSocket.OPEN) {
+      let anyBlocked = false;
+      for (const other of sessions.values()) {
+        if (other.type === 'tcp' && other.connected && other.sock && other.sock.writableNeedDrain) {
+          anyBlocked = true;
+          break;
+        }
+      }
+      if (!anyBlocked) resumeWsReceiver(ws);
+    }
     if (notifyClient) sendMuxControl(sessionId, 0x03, isError ? 0x02 : 0x00);
   };
 
@@ -913,7 +1099,7 @@ function handleVlessMux(ws, id, version, initialPayload) {
     if (sessions.has(sessionId)) {
       closeSession(sessionId, false, false);
     }
-    if (sessions.size >= 64 || isBlockedTarget(host, port)) {
+    if (sessions.size >= RES.muxMaxSessions || isBlockedTarget(host, port)) {
       if (isBlockedTarget(host, port)) nodeMetrics.errors.blocked++;
       return sendMuxControl(sessionId, 0x03, 0x02);
     }
@@ -956,11 +1142,11 @@ function handleVlessMux(ws, id, version, initialPayload) {
         sock.on('data', (chunk) => {
           sess.lastActive = Date.now();
           sendMuxTcpData(sessionId, chunk);
-          if (ws.bufferedAmount > 512 * 1024 && !sock.destroyed) {
+          if (ws.bufferedAmount > RES.wsHighWater && !sock.destroyed) {
             sock.pause();
             if (!sess.drainTimer) {
               sess.drainTimer = setInterval(() => {
-                if (closed || sess.closed || sock.destroyed || ws.bufferedAmount < 128 * 1024) {
+                if (closed || sess.closed || sock.destroyed || ws.bufferedAmount < RES.wsLowWater) {
                   clearInterval(sess.drainTimer);
                   sess.drainTimer = null;
                   if (!sock.destroyed && !closed && !sess.closed) sock.resume();
@@ -981,7 +1167,7 @@ function handleVlessMux(ws, id, version, initialPayload) {
     if (sessions.has(sessionId)) {
       closeSession(sessionId, false, false);
     }
-    if (sessions.size >= 64 || isBlockedTarget(host, port)) {
+    if (sessions.size >= RES.muxMaxSessions || isBlockedTarget(host, port)) {
       if (isBlockedTarget(host, port)) nodeMetrics.errors.blocked++;
       return sendMuxControl(sessionId, 0x03, 0x02);
     }
@@ -1005,7 +1191,7 @@ function handleVlessMux(ws, id, version, initialPayload) {
       sock.on('message', (msg, rinfo) => {
         if (closed || sess.closed) return;
         sess.lastActive = Date.now();
-        if (ws.bufferedAmount > 262144) {
+        if (ws.bufferedAmount > RES.udpMaxBuffered) {
           nodeMetrics.errors.udpDrop++;
           return;
         }
@@ -1047,7 +1233,7 @@ function handleVlessMux(ws, id, version, initialPayload) {
   const consumeMux = (chunk) => {
     if (closed) return;
     if (chunk && chunk.length > 0) {
-      if (muxBuf.length + chunk.length > 524288) {
+      if (muxBuf.length + chunk.length > RES.muxMaxBuf) {
         log('ERR', id, 'VLESS-MUX buffer overflow');
         return cleanupAll();
       }
@@ -1120,7 +1306,7 @@ function handleVlessMux(ws, id, version, initialPayload) {
               if (!writeChunkedToTcp(sess.sock, payload)) {
                 pauseWsReceiver(ws);
               }
-            } else if (sess.pending.length < 32 && sess.pendingBytes + payload.length <= 262144) {
+            } else if (sess.pending.length < 32 && sess.pendingBytes + payload.length <= RES.preconnectMax) {
               sess.pending.push(Buffer.from(payload));
               sess.pendingBytes += payload.length;
             } else {
@@ -1244,7 +1430,7 @@ function handleVlessConnection(ws, id) {
     let pendingBytes = 0;
     const onEarlyMessage = (chunk) => {
       const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      if (pendingBytes + b.length > 262144) {
+      if (pendingBytes + b.length > RES.preconnectMax) {
         pendingChunks.length = 0;
         if (remoteSocket) remoteSocket.destroy();
         if (ws.readyState === WebSocket.OPEN) ws.close(1009, 'Pre-connect buffer exceeded');
@@ -1252,7 +1438,7 @@ function handleVlessConnection(ws, id) {
       }
       pendingChunks.push(b);
       pendingBytes += b.length;
-      if (pendingChunks.length > 16 || pendingBytes >= 65536) {
+      if (pendingChunks.length > 16 || pendingBytes >= RES.preconnectPause) {
         pauseWsReceiver(ws);
       }
     };
@@ -1378,6 +1564,9 @@ function sendHeartbeat() {
     runtime: 'render',
     uptimeSec: Math.floor(process.uptime()),
     rssBytes: mem.rss,
+    memLimitBytes: MEM_LIMIT_BYTES,
+    memProfile: RES.tier,
+    maxTotalConns: RES.maxTotalConns,
     heapUsedBytes: mem.heapUsed,
     activeWs: wss.clients.size,
     totalConns: nodeMetrics.totalConns,
@@ -1425,7 +1614,7 @@ function sendHeartbeat() {
   req.end();
 }
 
-setInterval(sendHeartbeat, 30000).unref();
+setInterval(sendHeartbeat, 60000).unref();
 
 function extractClientIp(request) {
   const direct = request.headers['true-client-ip'] || request.headers['cf-connecting-ip'];
@@ -1451,6 +1640,9 @@ function getHealthJson() {
     runtime: 'render',
     uptimeSec: Math.floor(process.uptime()),
     rssBytes: mem.rss,
+    memLimitBytes: MEM_LIMIT_BYTES,
+    memProfile: RES.tier,
+    maxTotalConns: RES.maxTotalConns,
     activeWs: wss.clients.size,
     totalConns: nodeMetrics.totalConns
   });
@@ -1483,7 +1675,7 @@ httpServer.on('upgrade', async (request, socket, head) => {
   socket.on('error', () => socket.destroy());
   socket.setNoDelay(true);
 
-  if (wss.clients.size >= MAX_TOTAL_CONNS) {
+  if (memoryPressureActive || checkMemoryPressure() || wss.clients.size >= MAX_TOTAL_CONNS) {
     if (socket.writable) socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
     return socket.destroy();
   }
@@ -1503,7 +1695,7 @@ httpServer.on('upgrade', async (request, socket, head) => {
     return socket.destroy();
   }
 
-  if (wss.clients.size >= MAX_TOTAL_CONNS) {
+  if (memoryPressureActive || checkMemoryPressure() || wss.clients.size >= MAX_TOTAL_CONNS) {
     socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
     return socket.destroy();
   }
@@ -1537,6 +1729,8 @@ httpServer.on('upgrade', async (request, socket, head) => {
 });
 
 httpServer.listen(PORT, '0.0.0.0', () => {
-  log('SYS', null, `VLESS Render/Edge-TLS (/vless, chunk=${MAX_CHUNK}B) listening on 0.0.0.0:${PORT}`);
+  log('SYS', null, `VLESS Render/Edge-TLS (/vless, ram=${MEM_LIMIT_MB}MB[${RES.tier}], maxConns=${RES.maxTotalConns}, chunk=${MAX_CHUNK}B) listening on 0.0.0.0:${PORT}`);
   registerRenderHost();
 });
+
+})();
